@@ -1,4 +1,5 @@
 import random
+import pymongo
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,8 +30,10 @@ class GameApp:
     def configure_routes(self):
         self.app.route('/api/register', methods=['POST'])(self.register_user)
         self.app.route('/api/user/<username>', methods=['GET', 'POST'])(self.attempt_login)
+        self.app.route('/api/user/<username>/profile', methods=['GET'])(self.get_account_data)
         self.app.route('/api/user/<username>/hunt', methods=['PUT'])(self.trigger_hunt)
-        self.app.route('/api/user/<username>/delete', methods=['DELETE'])(self.trigger_hunt)
+        self.app.route('/api/user/<username>/delete', methods=['DELETE'])(self.delete_user_data)
+        self.app.route('/api/global', methods=['GET'])(self.get_global_hunt)
         return
 
     def check_username_exists(self, username):
@@ -58,8 +61,8 @@ class GameApp:
             user_profile.pop('_id')
             user_last_hunt = self.get_user_last_hunt(data['username'])
             user_last_hunt.pop('_id')
-            print(user_profile)
             print(user_last_hunt)
+            print(user_profile)
             return jsonify({'profile': user_profile, 'last_hunt': user_last_hunt})
 
         return jsonify({'error': 'User not found'}), 404
@@ -104,37 +107,61 @@ class GameApp:
 
         return jsonify({'message': 'User registered successfully'}), 201
 
-    def trigger_hunt(self):
+    def trigger_hunt(self, username):
         """
         When hunt is triggered, fetch user profile gold, exp, hunt
         then update with random values +5 to +20 for gold and exp, +1 for hunt count
         """
         data = request.get_json()
+        self.update_user_profile(username, data['goldGained'], data['expGained'])
+        self.update_user_last_hunt(username, datetime.now(), data['goldGained'], data['expGained'])
 
-        user_profile = self._mongo_fetch_user_profile(data['username'])
-        user_last_hunt = {}
+        return jsonify({'profile': data})
 
-        gold_gained, exp_gained = self.get_gold_exp_gained()
-
-        user_profile['gold'] += gold_gained
-        user_profile['exp'] += exp_gained
-        user_profile['hunt_count'] += 1
-
-        user_last_hunt['username'] = user_profile['username']
-        user_last_hunt['timestamp'] = datetime.now()
-        user_last_hunt['gold_gained'] = gold_gained
-        user_last_hunt['exp_gained'] = exp_gained
-
-        last_hunt_db = self._mongo_fetch_last_hunt(data['username'])
-        last_hunt_db.insert_one(user_last_hunt)
-
-        return jsonify({'profile': user_profile, 'last_hunt': user_last_hunt})
-
-    def update_user_profile(self, username, gold, exp, hunt_count):
+    def update_user_profile(self, username, gold, exp):
+        user_profile = self._mongo_connect_user_data()
+        profile_filter = {'username': username}
+        update = {'$inc': {
+            'gold': gold,
+            'exp': exp,
+            'hunt_count': 1
+            }
+        }
+        result = user_profile.update_one(profile_filter, update)
         return
 
     def update_user_last_hunt(self, username, timestamp, gold_gained, exp_gained):
+        last_hunt_data = {
+            'username': username,
+            'timestamp': timestamp,
+            'gold_gained': gold_gained,
+            'exp_gained': exp_gained
+        }
+        last_hunt = self._mongo_connect_last_hunt()
+
+        hunts_history = self._mongo_connect_last_hunt()
+        hunts_history.insert_one(last_hunt_data)
         return
+
+    def get_account_data(self, username):
+        exists = self.check_username_exists(username)
+        if exists:
+            user_profile = self.get_user_profile(username)
+            user_last_hunt = self.get_user_last_hunt(username)
+            user_profile.pop('_id')
+            user_last_hunt.pop('_id')
+            return jsonify({'user_profile': user_profile, 'user_last_hunt': user_last_hunt})
+        return jsonify({'error': 'User not found'}), 404
+
+    def get_global_hunt(self):
+        global_hunt = self._mongo_connect_last_hunt()
+        global_hunt_data = list(global_hunt.find({}).sort("timestamp", pymongo.DESCENDING).limit(5))
+
+        for hunt in global_hunt_data:
+            if '_id' in hunt:
+                del hunt['_id']
+        print(global_hunt_data)
+        return jsonify(global_hunt_data)
 
     def get_user_profile(self, username):
         user_profile = self._mongo_fetch_user_profile(username)
@@ -146,16 +173,32 @@ class GameApp:
         user_last_hunt = self._mongo_fetch_last_hunt(username)
         if not user_last_hunt:
             return {}
-        return user_last_hunt
+        return next(user_last_hunt)
 
-    def delete_user_data(self):
-        data = request.get_json()
-        user_account = self._mongo_connect_private(data['username'])
-        # TODO: delete account fn
-        return
+    def delete_user_data(self, username):
+        print(username)
+        accounts = self._mongo_connect_private()
+        user_data = self._mongo_connect_user_data()
+        db_filter = {'username': username}
+
+        exists = self.check_username_exists(username)
+        if exists:
+            accounts.delete_one(db_filter)
+            user_data.delete_one(db_filter)
+
+            user_check = accounts.find_one(db_filter)
+            if user_check is None:
+                print("Deleted account successfully")
+                return jsonify({'result': 'Success deletion of account'})
+            else:
+                print("Failed to delete account")
+                return jsonify({'error': 'Failed to delete account'}), 500
+        else:
+            print("User not found")
+            return jsonify({'error': 'User not found'}), 404
 
     @staticmethod
-    def get_gold_exp_gained():
+    def generate_gold_exp_gained():
         gold_gained = random.randint(5, 20)
         exp_gained = random.randint(5, 20)
         return gold_gained, exp_gained
@@ -174,7 +217,7 @@ class GameApp:
         return user_data
 
     def _mongo_connect_last_hunt(self):
-        last_hunt = self.mongo_connector.connect_table('global_feed', 'last_hunt')
+        last_hunt = self.mongo_connector.connect_table('global_feed', 'hunts_history')
         return last_hunt
 
     def _mongo_fetch_private(self, username):
@@ -186,8 +229,8 @@ class GameApp:
         return user_data.find_one({'username': username})
 
     def _mongo_fetch_last_hunt(self, username):
-        user_data = self.mongo_connector.connect_table('global_feed', 'last_hunt')
-        return user_data.find_one({'username': username})
+        user_data = self.mongo_connector.connect_table('global_feed', 'hunts_history')
+        return user_data.find({'username': username}).sort([('timestamp', -1)]).limit(1)
 
     def return_profile_username(self, username):
         profile = self._mongo_fetch_user_profile(username)
